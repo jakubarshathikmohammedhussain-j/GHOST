@@ -1,38 +1,20 @@
 import os
 import json
 import time
-import re
 import urllib.parse
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-import requests
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from jobspy import scrape_jobs
 
 # -------------------------------------------------------------
-# PROFILE HEURISTICS MATRIX (Mohammed Hussain J.)
-# Background: MBA (Analytics & Supply Chain), B.Com
-# Core: Operations Architecture, Tech Strategy, LLM/AI Workflows, BI
+# CORE CONFIGURATION & HEURISTICS
 # -------------------------------------------------------------
-PROFILE_KEYWORDS = {
-    "tier_1_core": [
-        "consulting", "strategy", "operations", "business intelligence", 
-        "supply chain", "product manager", "management consultant",
-        "digital transformation", "business analyst", "automation"
-    ],
-    "tier_2_skills": [
-        "python", "data analytics", "logistics", "ai", "llm", "pipeline", 
-        "process optimization", "scrm", "workflow", "tableau", "power bi"
-    ],
-    "experience_filter": [
-        "junior", "entry", "associate", "intern", "internship", "analyst", 
-        "graduate", "trainee", "0-2", "0-3", "1-3", "early career"
-    ]
-}
-
-TARGET_LOCATIONS = ["remote", "chennai", "india", "dubai", "uae", "singapore", "europe", "germany", "uk", "netherlands"]
+SEARCH_LOCATIONS = ["Chennai, India", "Dubai, UAE", "Singapore", "Europe", "Remote"]
+SEARCH_TERMS = "consulting OR strategy OR operations OR product manager OR analytics OR ai"
 
 COLUMNS = [
     "Date Found", "Job Title", "Company", "Location", "Compensation",
@@ -40,165 +22,83 @@ COLUMNS = [
     "Application Link", "Hiring Lead Search Query"
 ]
 
-def calculate_portfolio_match(title, description):
+def analyze_job(title, description, job_type):
     text = f"{title} {description}".lower()
     
-    score = 40  # Baseline for matching search queries
-    rationale = []
-
-    # Check experience tier
-    exp_matched = [word for word in PROFILE_KEYWORDS["experience_filter"] if word in text]
-    if exp_matched or ("senior" not in title.lower() and "lead" not in title.lower() and "director" not in title.lower()):
-        score += 20
-        rationale.append("Aligned with 0-3Y / Early-Career Scope")
-    else:
-        score -= 20
-
-    # Match primary strategy/consulting domains
-    core_hits = [k for k in PROFILE_KEYWORDS["tier_1_core"] if k in text]
-    if core_hits:
-        score += min(len(core_hits) * 8, 25)
-        rationale.append(f"Domain Focus: {', '.join(core_hits[:3]).title()}")
-
-    # Match technical/data architecture capabilities
-    tech_hits = [k for k in PROFILE_KEYWORDS["tier_2_skills"] if k in text]
-    if tech_hits:
-        score += min(len(tech_hits) * 5, 15)
-        rationale.append(f"Tech Alignment: {', '.join(tech_hits[:3]).upper()}")
-
-    score = max(30, min(score, 98))
-    rationale_str = " | ".join(rationale) if rationale else "General operations profile relevance"
-    return score, rationale_str
-
-def detect_visa_status(text):
-    text_lower = text.lower()
-    if any(k in text_lower for k in ["visa sponsorship", "visa supported", "sponsorship available", "work permit provided"]):
-        return "Sponsorship Offered"
-    elif any(k in text_lower for k in ["no sponsorship", "must have valid work authorization", "citizens only", "no visa"]):
-        return "No Sponsorship"
-    return "Undisclosed / Verify"
-
-def fetch_job_stream():
-    jobs = []
+    # 1. Detect Internship (Matches MBA ongoing status)
+    is_intern = "intern" in text or (isinstance(job_type, str) and "intern" in job_type.lower())
     
-    # Source 1: Arbeitnow Global API (Comprehensive Visa Sponsorship & European Data)
-    try:
-        res = requests.get("https://www.arbeitnow.com/api/job-board-api", timeout=15)
-        if res.status_code == 200:
-            data = res.json().get("data", [])
-            for item in data:
-                title = item.get("title", "")
-                desc = item.get("description", "")
-                location = item.get("location", "")
-                remote = item.get("remote", False)
-                sponsored = item.get("visa_sponsorship", False)
-                url = item.get("url", "")
-                company = item.get("company_name", "")
-
-                text_combined = f"{title} {desc} {location}".lower()
-
-                # Filter roles
-                is_target_role = any(r in text_combined for r in ["consult", "strateg", "operat", "product", "analyst", "intern"])
-                is_target_geo = any(loc in text_combined for loc in TARGET_LOCATIONS) or remote
-
-                if is_target_role and is_target_geo:
-                    visa_status = "Sponsorship Offered" if sponsored else detect_visa_status(desc)
-                    is_intern = "intern" in title.lower() or "internship" in title.lower() or "intern" in desc.lower()[:300]
-                    
-                    jobs.append({
-                        "title": title,
-                        "company": company,
-                        "location": "Remote" if remote else location,
-                        "salary": "Disclosed in Portal" if "€" not in desc and "$" not in desc else "Competitive / Stated",
-                        "description": desc[:350] + "...",
-                        "url": url,
-                        "visa": visa_status,
-                        "is_intern": is_intern,
-                        "is_remote": remote
-                    })
-    except Exception as e:
-        print(f"[GHOST] Source 1 fetch error: {e}")
-
-    # Source 2: Remotive Global Strategy & Product API
-    try:
-        res = requests.get("https://remotive.com/api/remote-jobs?limit=50", timeout=15)
-        if res.status_code == 200:
-            remotive_jobs = res.json().get("jobs", [])
-            for item in remotive_jobs:
-                title = item.get("title", "")
-                category = item.get("category", "").lower()
-                desc = item.get("description", "")
-                company = item.get("company_name", "")
-                url = item.get("url", "")
-                salary = item.get("salary", "Disclosed in Portal")
-
-                if any(c in category for c in ["product", "business", "data", "finance"]):
-                    is_intern = "intern" in title.lower() or "intern" in desc.lower()[:200]
-                    jobs.append({
-                        "title": title,
-                        "company": company,
-                        "location": "Global / Remote",
-                        "salary": salary if salary else "Disclosed in Portal",
-                        "description": desc[:350] + "...",
-                        "url": url,
-                        "visa": detect_visa_status(desc),
-                        "is_intern": is_intern,
-                        "is_remote": True
-                    })
-    except Exception as e:
-        print(f"[GHOST] Source 2 fetch error: {e}")
-
-    return jobs
+    # 2. Detect Visa Sponsorship
+    visa = "Undisclosed / Verify"
+    if any(k in text for k in ["visa sponsorship", "relocation support", "work permit provided", "sponsor visa", "visa supported"]):
+        visa = "Sponsorship Offered"
+    elif any(k in text for k in ["no sponsorship", "citizens only", "must have right to work", "no visa"]):
+        visa = "No Sponsorship"
+        
+    # 3. Calculate Portfolio Match Score (Systems Architect, MBA Analytics, Supply Chain, Logistics)
+    score = 40
+    rationale = []
+    
+    # Experience Level (0-3 Years)
+    if any(k in text for k in ["junior", "entry", "associate", "graduate", "0-3", "0-2", "early career", "trainee"]):
+        score += 20
+        rationale.append("Early-Career Scope")
+    elif any(k in text for k in ["senior", "director", "manager", "5+ years", "10+ years"]):
+        score -= 20 # Penalize senior roles
+    
+    # Core Domain Alignment
+    core_hits = [k for k in ["consulting", "strategy", "operations", "product", "supply chain", "logistics"] if k in text]
+    if core_hits:
+        score += 20
+        rationale.append(f"Domain: {core_hits[0].title()}")
+        
+    # Tech / Systems Alignment
+    tech_hits = [k for k in ["python", "analytics", "sql", "ai", "tableau", "automation", "llm", "power bi"] if k in text]
+    if tech_hits:
+        score += 15
+        rationale.append("Tech/Systems Aligned")
+        
+    return min(max(score, 10), 98), " | ".join(rationale) if rationale else "General Match", is_intern, visa
 
 def send_recon_email(dispatched_jobs, recipient_email):
     sender_email = os.environ.get('GMAIL_USER')
     sender_password = os.environ.get('GMAIL_APP_PASSWORD')
-    
-    if not sender_email or not sender_password or not dispatched_jobs:
+    if not sender_email or not sender_password or not dispatched_jobs: 
         return
 
-    # Take top 5 highest matching roles
-    top_matches = sorted(dispatched_jobs, key=lambda x: x['match_score'], reverse=True)[:5]
+    top_matches = sorted(dispatched_jobs, key=lambda x: x['match'], reverse=True)[:5]
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
 
     msg = MIMEMultipart()
     msg['From'] = f"GHOST Recon Node <{sender_email}>"
     msg['To'] = recipient_email
-    msg['Subject'] = f"GHOST Alert: {len(dispatched_jobs)} Strategic Positions Logged ({today_str})"
+    msg['Subject'] = f"GHOST Alert: {len(dispatched_jobs)} Strategic Positions Logged"
 
-    def generate_job_card(j):
-        encoded_query = urllib.parse.quote(f"{j['company']} {j['title']} recruiter")
-        linkedin_lead = f"https://www.linkedin.com/search/results/people/?keywords={encoded_query}"
-        
-        return f"""
+    html_content = f"""
+    <div style="font-family: Arial, sans-serif; color: #222; line-height: 1.5; max-width: 600px;">
+        <h2 style="color: #000; margin-bottom: 2px;">GHOST Autonomous Reconnaissance Node</h2>
+        <p style="color: #666; font-size: 14px; margin-top: 0;">Cycle Execution Complete &bull; 4-Hour Delta Synchronized</p>
+        <p><b>{len(dispatched_jobs)}</b> verified roles from Global Job Portals have been logged and auto-formatted.</p>
+        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
+    """
+    
+    for j in top_matches:
+        html_content += f"""
         <div style="border-left: 4px solid #00E676; background-color: #f8f9fa; padding: 14px; margin-bottom: 15px; border-radius: 4px;">
-            <h3 style="margin: 0 0 6px 0; color: #111;">{j['title']} &bull; <span style="color: #555;">{j['company']}</span></h3>
-            <p style="margin: 4px 0; font-size: 14px;"><b>Location:</b> {j['location']} | <b>Comp:</b> {j['salary']}</p>
-            <p style="margin: 4px 0; font-size: 14px;"><b>Visa Status:</b> <span style="color: #2e7d32; font-weight: bold;">{j['visa']}</span> | <b>Match:</b> <span style="color: #0d47a1; font-weight: bold;">{j['match_score']}%</span></p>
+            <h3 style="margin: 0 0 4px 0;">{j['title']} &bull; <span style="color: #555;">{j['company']}</span></h3>
+            <p style="margin: 4px 0; font-size: 14px;"><b>Loc:</b> {j['location']} | <b>Comp:</b> {j['comp']}</p>
+            <p style="margin: 4px 0; font-size: 14px;"><b>Match:</b> <span style="color: #0d47a1; font-weight: bold;">{j['match']}%</span> | <b>Visa:</b> <span style="color: #2e7d32; font-weight: bold;">{j['visa']}</span></p>
             <p style="margin: 4px 0; font-size: 13px; color: #444;"><i>{j['rationale']}</i></p>
             <div style="margin-top: 10px;">
                 <a href="{j['url']}" style="background-color: #00E676; color: #000; padding: 6px 12px; text-decoration: none; font-weight: bold; border-radius: 4px; font-size: 13px; display: inline-block;">Apply Now</a>
-                <a href="{linkedin_lead}" style="background-color: #0077B5; color: #fff; padding: 6px 12px; text-decoration: none; font-weight: bold; border-radius: 4px; font-size: 13px; display: inline-block; margin-left: 8px;">Locate Hiring Lead</a>
+                <a href="{j['lead_url']}" style="background-color: #0077B5; color: #fff; padding: 6px 12px; text-decoration: none; font-weight: bold; border-radius: 4px; font-size: 13px; display: inline-block; margin-left: 8px;">Locate Hiring Lead</a>
             </div>
         </div>
         """
-
-    html_content = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; color: #222; line-height: 1.5;">
-        <h2 style="color: #000; margin-bottom: 2px;">GHOST Autonomous Reconnaissance Node</h2>
-        <p style="color: #666; font-size: 14px; margin-top: 0;">Cycle Execution Complete &bull; 4-Hour Delta Synchronized</p>
-        <p>A total of <b>{len(dispatched_jobs)}</b> verified roles matched your profile criteria and have been logged across your 3 target Google Sheets tabs.</p>
-        <hr style="border: none; border-top: 1px solid #eee; margin: 20px 0;">
-        <h3 style="color: #111;">Top Strategic Opportunities Found</h3>
-        {''.join([generate_job_card(job) for job in top_matches])}
-        <br>
-        <p style="font-size: 12px; color: #888;">GHOST Reconnaissance Engine &bull; HOLO_EARTH Autonomous Systems</p>
-      </body>
-    </html>
-    """
+    
+    html_content += "</div>"
     msg.attach(MIMEText(html_content, 'html'))
-
+    
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
@@ -210,10 +110,10 @@ def send_recon_email(dispatched_jobs, recipient_email):
         print(f"[GHOST] Email error: {e}")
 
 def main():
-    print("[GHOST] Initializing reconnaissance stream...")
+    print("[GHOST V2] Initializing Global Stealth Scraper Engine...")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
 
-    # Authenticate with Google
+    # 1. Connect to Google Sheets
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
     creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
     creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
@@ -227,84 +127,141 @@ def main():
         try:
             worksheets[tab] = sheet.worksheet(tab)
         except gspread.exceptions.WorksheetNotFound:
-            ws = sheet.add_worksheet(title=tab, rows="2000", cols="12")
+            ws = sheet.add_worksheet(title=tab, rows="2000", cols="10")
             ws.append_row(COLUMNS)
             worksheets[tab] = ws
-            time.sleep(1.0)
+            time.sleep(1)
 
-    # Scrape and process candidates
-    raw_jobs = fetch_job_stream()
-    print(f"[GHOST] Parsed {len(raw_jobs)} candidate positions. Scoring against portfolio profile...")
+    # 2. Scrape Jobs across multiple locations and platforms
+    all_jobs_df = []
+    
+    # Defining the extended platform array
+    target_platforms = ["linkedin", "indeed", "glassdoor", "zip_recruiter", "google", "naukri", "bayt"]
+    
+    for loc in SEARCH_LOCATIONS:
+        print(f"[GHOST] Scanning {loc} across global portals...")
+        try:
+            df = scrape_jobs(
+                site_name=target_platforms,
+                search_term=SEARCH_TERMS,
+                location=loc,
+                results_wanted=10, 
+                hours_old=24, # Ensure fresh delta
+                google_search_term=f"{SEARCH_TERMS} jobs in {loc} since yesterday"
+            )
+            if not df.empty:
+                all_jobs_df.append(df)
+            time.sleep(3) # Strict anti-ban pacing for web firewalls
+        except Exception as e:
+            print(f"[GHOST] Scraper error on {loc}: {e}")
 
+    if not all_jobs_df:
+        print("[GHOST] No new jobs found in this 4-hour cycle. Exiting.")
+        return
+
+    raw_jobs = pd.concat(all_jobs_df, ignore_index=True)
+    
+    # 3. Deduplication (Fetch already seen URLs)
     seen_urls = set()
     for ws in worksheets.values():
         try:
-            urls = ws.col_values(9) # Application Link column
-            seen_urls.update(urls)
-        except Exception:
+            seen_urls.update(ws.col_values(9))
+        except:
             pass
 
     logged_jobs = []
     tab_batches = {tab: [] for tab in tab_names}
 
-    for job in raw_jobs:
-        if job['url'] in seen_urls:
+    # 4. Process, Score, and Route Jobs
+    for _, job in raw_jobs.iterrows():
+        url = str(job.get('job_url', ''))
+        if url in seen_urls or not url or url.lower() == 'nan':
             continue
 
-        match_score, match_rationale = calculate_portfolio_match(job['title'], job['description'])
+        title = str(job.get('title', ''))
+        company = str(job.get('company', ''))
+        desc = str(job.get('description', ''))
+        loc = str(job.get('location', ''))
         
-        # Only accept relevant opportunities
-        if match_score < 60:
-            continue
+        # Format Compensation
+        comp_min = job.get('min_amount')
+        comp_max = job.get('max_amount')
+        comp_curr = job.get('currency', '')
+        if pd.notna(comp_min) and pd.notna(comp_max):
+            comp = f"{comp_min} - {comp_max} {comp_curr}"
+        elif pd.notna(comp_min):
+            comp = f"{comp_min} {comp_curr}"
+        else:
+            comp = "Disclosed in Portal"
+            
+        job_type = str(job.get('job_type', ''))
 
-        encoded_lead_query = urllib.parse.quote(f"{job['company']} {job['title']} recruiter")
-        hiring_lead_url = f"https://www.linkedin.com/search/results/people/?keywords={encoded_lead_query}"
+        match_score, rationale, is_intern, visa = analyze_job(title, desc, job_type)
+        
+        # Strict relevance threshold
+        if match_score < 55: 
+            continue 
+
+        # Generate LinkedIn Recruiter URL
+        encoded_query = urllib.parse.quote(f"{company} {title} recruiter")
+        lead_url = f"https://www.linkedin.com/search/results/people/?keywords={encoded_query}"
 
         row_payload = [
-            today_str,
-            job['title'],
-            job['company'],
-            job['location'],
-            job['salary'],
-            f"{match_score}%",
-            match_rationale,
-            job['visa'],
-            job['url'],
-            hiring_lead_url
+            today_str, title, company, loc, comp, f"{match_score}%", 
+            rationale, visa, url, lead_url
         ]
 
-        # Route to corresponding tab
-        if job['is_intern'] and job['is_remote']:
+        # Route to exact Tab
+        if is_intern:
             tab_batches["Paid_Remote_Internships"].append(row_payload)
-        elif job['visa'] == "Sponsorship Offered":
+        elif visa == "Sponsorship Offered":
             tab_batches["Visa_Sponsorship"].append(row_payload)
         else:
             tab_batches["Direct_Domestic_Undisclosed"].append(row_payload)
 
-        seen_urls.add(job['url'])
-        job['match_score'] = match_score
-        job['rationale'] = match_rationale
-        logged_jobs.append(job)
-
-        # Cap batch to 20 highest-relevance jobs per run
-        if len(logged_jobs) >= 20:
+        seen_urls.add(url)
+        logged_jobs.append({
+            "title": title, "company": company, "location": loc, 
+            "comp": comp, "match": match_score, "visa": visa, 
+            "url": url, "lead_url": lead_url, "rationale": rationale
+        })
+        
+        # Hard cap to 20 jobs per 4-hour cycle to prevent sheet bloat
+        if len(logged_jobs) >= 20: 
             break
 
-    # Bulk insert rows into each tab
+    # 5. Log to Sheets and Auto-Resize Columns
     for tab, rows in tab_batches.items():
         if rows:
-            worksheets[tab].append_rows(rows, value_input_option='USER_ENTERED')
+            ws = worksheets[tab]
+            # Append data
+            ws.append_rows(rows, value_input_option='USER_ENTERED')
             print(f"[GHOST] Logged {len(rows)} opportunities into '{tab}'.")
-            time.sleep(1.2)
+            
+            # API Payload to instantly auto-fit columns A through J
+            try:
+                sheet.batch_update({
+                    "requests": [{
+                        "autoResizeDimensions": {
+                            "dimensions": {
+                                "sheetId": ws.id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 0,
+                                "endIndex": 10
+                            }
+                        }
+                    }]
+                })
+            except Exception as e:
+                print(f"[GHOST] Auto-resize warning for {tab}: {e}")
 
-    # Send summary email
+    # 6. Dispatch Email Briefing
     if logged_jobs:
         send_recon_email(logged_jobs, os.environ.get('GMAIL_USER'))
+        print(f"[GHOST] Cycle Complete. {len(logged_jobs)} total roles secured.")
     else:
-        print("[GHOST] No new distinct positions found in this 4-hour cycle.")
-
-    print("[GHOST] Operational reconnaissance completed.")
+        print("[GHOST] No highly relevant roles passed the filter in this cycle.")
 
 if __name__ == "__main__":
     main()
-              
+        
