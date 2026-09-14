@@ -22,41 +22,72 @@ COLUMNS = [
     "Application Link", "Hiring Lead Search Query"
 ]
 
+# Disqualifying title prefixes and executive ranks
+BANNED_TITLE_KEYWORDS = [
+    "vp", "vice president", "chief", "director", "head of", "principal", 
+    "lead", "senior manager", "sr. manager", "managing consultant", 
+    "partner", "general manager", "executive", "architect"
+]
+
+# Strict upper experience boundary
+EXPERIENCE_OVERQUALIFIED = [
+    "4+ years", "5+ years", "6+ years", "7+ years", "8+ years", 
+    "10+ years", "5-7 years", "7-10 years", "minimum 5 years"
+]
+
 def analyze_job(title, description, job_type):
-    text = f"{title} {description}".lower()
+    title_lower = title.lower()
+    text_lower = f"{title_lower} {description.lower()}"
     
-    # 1. Detect Internship (Matches MBA ongoing status)
-    is_intern = "intern" in text or (isinstance(job_type, str) and "intern" in job_type.lower())
+    # 1. HARD GATEKEEPER: Instant disqualification on executive/senior titles
+    if any(banned in title_lower for banned in BANNED_TITLE_KEYWORDS):
+        return 0, "Disqualified: Executive / Senior Role", False, "No"
     
-    # 2. Detect Visa Sponsorship
+    # Handle "senior" or "sr" explicitly in title unless it's a junior tag
+    if ("senior" in title_lower or " sr " in f" {title_lower} " or "sr." in title_lower) and "junior" not in title_lower:
+        return 0, "Disqualified: Senior Title", False, "No"
+
+    # 2. HARD GATEKEEPER: Disqualify high years of experience requirements
+    if any(exp in text_lower for exp in EXPERIENCE_OVERQUALIFIED):
+        return 0, "Disqualified: Requires 4+ Years Experience", False, "No"
+
+    # 3. Detect Internship
+    is_intern = "intern" in text_lower or (isinstance(job_type, str) and "intern" in job_type.lower())
+
+    # 4. Detect Visa Sponsorship
     visa = "Undisclosed / Verify"
-    if any(k in text for k in ["visa sponsorship", "relocation support", "work permit provided", "sponsor visa", "visa supported"]):
+    if any(k in text_lower for k in ["visa sponsorship", "relocation support", "work permit provided", "sponsor visa", "visa supported"]):
         visa = "Sponsorship Offered"
-    elif any(k in text for k in ["no sponsorship", "citizens only", "must have right to work", "no visa"]):
+    elif any(k in text_lower for k in ["no sponsorship", "citizens only", "must have right to work", "no visa"]):
         visa = "No Sponsorship"
-        
-    # 3. Calculate Portfolio Match Score (Systems Architect, MBA Analytics, Supply Chain, Logistics)
-    score = 40
+
+    # 5. Calculate Match Score for 0-3Y Scope
+    score = 25 # Lower base score to enforce strict qualification
     rationale = []
-    
-    # Experience Level (0-3 Years)
-    if any(k in text for k in ["junior", "entry", "associate", "graduate", "0-3", "0-2", "early career", "trainee"]):
+
+    # Early-Career Identifiers
+    early_career_hits = ["junior", "entry", "associate", "graduate", "0-3", "0-2", "early career", "trainee", "analyst", "intern"]
+    if any(k in title_lower for k in early_career_hits):
+        score += 35
+        rationale.append("Early-Career Title")
+    elif any(k in text_lower for k in early_career_hits):
         score += 20
         rationale.append("Early-Career Scope")
-    elif any(k in text for k in ["senior", "director", "manager", "5+ years", "10+ years"]):
-        score -= 20 # Penalize senior roles
-    
-    # Core Domain Alignment
-    core_hits = [k for k in ["consulting", "strategy", "operations", "product", "supply chain", "logistics"] if k in text]
+
+    # Domain Alignment
+    core_hits = [k for k in ["consulting", "strategy", "operations", "product", "supply chain", "logistics"] if k in text_lower]
     if core_hits:
         score += 20
         rationale.append(f"Domain: {core_hits[0].title()}")
-        
-    # Tech / Systems Alignment
-    tech_hits = [k for k in ["python", "analytics", "sql", "ai", "tableau", "automation", "llm", "power bi"] if k in text]
+
+    # Technical Alignment
+    tech_hits = [k for k in ["python", "analytics", "sql", "ai", "tableau", "automation", "power bi"] if k in text_lower]
     if tech_hits:
-        score += 15
-        rationale.append("Tech/Systems Aligned")
+        score += 20
+        rationale.append("Tech/Analytics")
+
+    final_score = min(max(score, 0), 98)
+    return final_score, " | ".join(rationale) if rationale else "General Match", is_intern, visa
         
     return min(max(score, 10), 98), " | ".join(rationale) if rationale else "General Match", is_intern, visa
 
