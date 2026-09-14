@@ -1,0 +1,33 @@
+name: GHOST Reconnaissance Node
+
+on:
+  schedule:
+    # Triggers every 4 hours automatically
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+jobs:
+  execute-recon:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install System Dependencies
+        run: pip install -r requirements.txt
+
+      - name: Execute Opportunity Sourcing & Dispatch Briefing
+        env:
+          GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+          SPREADSHEET_ID: ${{ secrets.SPREADSHEET_ID }}
+          GMAIL_USER: ${{ secrets.GMAIL_USER }}
+          GMAIL_APP_PASSWORD: ${{ secrets.GMAIL_APP_PASSWORD }}
+        run: python ghost_recon.py
+        
