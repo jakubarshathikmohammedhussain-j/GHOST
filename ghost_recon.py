@@ -3,19 +3,34 @@ import json
 import time
 import re
 import urllib.parse
-import smtplib
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
 from jobspy import scrape_jobs
 
 # ==========================================
-# CONFIGURATION & RECONNAISSANCE PARAMETERS
+# 1. SEARCH STREAMS & PARAMETERS
 # ==========================================
-SEARCH_LOCATIONS = ["Dubai, UAE", "United Kingdom", "Singapore", "United States", "Remote"]
-SEARCH_TERMS = "consulting OR strategy OR operations"
+TARGET_LOCATIONS = ["Dubai, UAE", "United Kingdom", "Singapore", "United States", "Remote"]
+
+# Three dedicated search streams to guarantee every bucket receives relevant hits
+SEARCH_STREAMS = [
+    {
+        "intent": "visa",
+        "query": '("visa sponsorship" OR "visa sponsor" OR "tier 2 visa" OR "skilled worker visa") AND (consulting OR strategy OR operations)',
+        "locations": ["United Kingdom", "Dubai, UAE", "Singapore", "United States"]
+    },
+    {
+        "intent": "internship",
+        "query": '(intern OR internship OR "working student") AND (consulting OR strategy OR operations)',
+        "locations": ["Remote", "United Kingdom", "United States", "Singapore"]
+    },
+    {
+        "intent": "direct",
+        "query": '("junior consultant" OR "associate consultant" OR "strategy associate" OR "operations associate" OR "management trainee")',
+        "locations": TARGET_LOCATIONS
+    }
+]
 
 COLUMNS_JOBS = [
     "Date Found", "Job Title", "Company", "Location", "Compensation",
@@ -29,11 +44,12 @@ COLUMNS_LEADS = [
     "Direct LinkedIn X-Ray URL", "Operational Hook Vector", "Outreach Status"
 ]
 
+# Strict exclusions: Drop Senior, Executive, Analyst, and Engineering roles
 BANNED_TITLE_KEYWORDS = [
     "vp", "vice president", "chief", "director", "head of", "principal", 
     "lead", "senior manager", "sr. manager", "managing consultant", 
     "partner", "general manager", "executive", "architect",
-    "analyst", "engineer", "engineering", "developer" # Dropping Analyst & Engineering
+    "analyst", "engineer", "engineering", "developer"
 ]
 
 EXPERIENCE_OVERQUALIFIED = [
@@ -57,94 +73,96 @@ CORPORATE_EMAIL_SYNTAX = {
 GENERIC_EMAILS = ['info@', 'hr@', 'careers@', 'admin@', 'support@', 'jobs@', 'apply@', 'contact@']
 
 # ==========================================
-# JOB HEURISTICS (STRICT 0-3Y & DOMAIN GATE)
+# 2. JOB HEURISTICS & BUCKET ROUTER
 # ==========================================
-def analyze_job(title, description, job_type, location):
+def analyze_and_route_job(title, description, job_type, location):
     title_lower = title.lower()
     text_lower = f"{title_lower} {description.lower()}"
     
     # 1. Gatekeeper: Drop Senior, Executive, Analyst, and Engineering titles
     if any(banned in title_lower for banned in BANNED_TITLE_KEYWORDS):
-        return 0, "Disqualified: Banned Domain/Rank", False, "No"
+        return 0, "Disqualified: Banned Domain/Rank", False, "No", None
     
     if ("senior" in title_lower or " sr " in f" {title_lower} " or "sr." in title_lower) and "junior" not in title_lower:
-        return 0, "Disqualified: Senior Title", False, "No"
+        return 0, "Disqualified: Senior Title", False, "No", None
 
-    # 2. Gatekeeper: Drop high experience barriers
+    # 2. Gatekeeper: Drop 4+ years experience requirements
     if any(exp in text_lower for exp in EXPERIENCE_OVERQUALIFIED):
-        return 0, "Disqualified: 4+ Years Required", False, "No"
+        return 0, "Disqualified: 4+ Years Required", False, "No", None
 
-    # Status Identifiers
+    # Flags
     is_intern = "intern" in text_lower or (isinstance(job_type, str) and "intern" in job_type.lower())
     is_remote = "remote" in location.lower() or "remote" in text_lower or "work from home" in text_lower
     
-    visa = "Undisclosed / Verify"
-    if any(k in text_lower for k in ["visa sponsorship", "relocation support", "work permit provided", "sponsor visa", "visa supported"]):
-        visa = "Sponsorship Offered"
-    elif any(k in text_lower for k in ["no sponsorship", "citizens only", "must have right to work"]):
-        visa = "No Sponsorship"
+    # Visa Detection
+    is_visa = any(k in text_lower for k in [
+        "visa sponsorship", "visa sponsor", "sponsorship available", 
+        "relocation support", "work permit provided", "tier 2", "skilled worker visa"
+    ])
+    has_no_visa = any(k in text_lower for k in ["no sponsorship", "citizens only", "must have right to work", "unable to sponsor"])
 
-    # Base Score
-    score = 20
-    rationale = []
+    if is_visa and not has_no_visa:
+        visa_status = "Sponsorship Offered"
+    elif has_no_visa:
+        visa_status = "No Sponsorship"
+    else:
+        visa_status = "Undisclosed / Verify"
 
-    # PRIORITY 1: Visa Sponsorship (+50)
-    if visa == "Sponsorship Offered":
-        score += 50
-        rationale.append("PRIORITY: Visa Sponsored")
+    # Multi-Tab Bucket Routing
+    if visa_status == "Sponsorship Offered":
+        assigned_bucket = "Visa_Sponsorship"
+        score = 90
+        rationale = "PRIORITY: Verified Visa Sponsorship"
+    elif is_intern and is_remote:
+        assigned_bucket = "Paid_Remote_Internships"
+        score = 85
+        rationale = "PRIORITY: Remote Internship Position"
+    else:
+        assigned_bucket = "Direct_Domestic_Undisclosed"
+        score = 75
+        rationale = "Direct Operational/Strategy Role (0-3Y)"
 
-    # PRIORITY 2: Remote Paid Internship (+40)
-    if is_intern and is_remote and "unpaid" not in text_lower:
-        score += 40
-        rationale.append("PRIORITY: Remote Paid Intern")
-
-    # Domain Alignment (+20)
+    # Core Domain Check
     core_hits = [k for k in ["consulting", "strategy", "operations"] if k in text_lower]
     if core_hits:
-        score += 20
-        rationale.append(f"Domain: {core_hits[0].title()}")
+        rationale += f" | {core_hits[0].title()}"
 
-    final_score = min(max(score, 0), 99)
-    return final_score, " | ".join(rationale) if rationale else "General Match", is_intern, visa
+    return score, rationale, is_intern, visa_status, assigned_bucket
 
 # ==========================================
-# RECRUITER EXTRACTION & LEAD ENGINE
+# 3. RECRUITER EXTRACTION & LEAD ENGINE
 # ==========================================
 def extract_real_recruiter_email(description):
-    """Scans raw JD text for emails and drops generic HR inboxes."""
+    """Scans raw JD text for human emails, excluding generic inboxes."""
     emails_found = re.findall(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', description)
     real_emails = [e for e in emails_found if not any(dummy in e.lower() for dummy in GENERIC_EMAILS)]
-    return real_emails[0] if real_emails else "None Found in Text"
+    return real_emails[0] if real_emails else "Pending X-Ray Outreach"
 
 def synthesize_executive_lead(company, location, domain, description):
     company_clean = company.strip()
     company_lower = company_clean.lower()
-    
-    # Attempt true email extraction
     real_email = extract_real_recruiter_email(description)
 
-    # Identify email domain pattern fallback
     pattern = "firstname.lastname@company.com"
     for k, v in CORPORATE_EMAIL_SYNTAX.items():
         if k in company_lower:
             pattern = v
             break
             
-    # Target Persona Selection
     if any(tier in company_lower for tier in ["mckinsey", "bcg", "bain"]):
-        target_role = "Engagement Manager / Associate Partner"
+        target_role = "Engagement Manager / Talent Lead"
     elif any(tier in company_lower for tier in ["deloitte", "pwc", "ey", "kpmg", "accenture", "strategy&"]):
-        target_role = "Senior Manager / Strategy Practice Lead"
+        target_role = "Practice Lead / Strategy Senior Manager"
     else:
-        target_role = "Director of Strategy & Operations / Talent Acquisition Lead"
+        target_role = "Director of Strategy & Operations / Talent Partner"
 
-    xray_query = f'site:linkedin.com/in ("{target_role.split(" / ")[0]}" OR "{target_role.split(" / ")[-1]}") "{company_clean}" "{location}"'
+    xray_query = f'site:linkedin.com/in ("{target_role.split(" / ")[0]}" OR "recruiter") "{company_clean}" "{location}"'
     xray_url = f"https://www.google.com/search?q={urllib.parse.quote(xray_query)}"
 
     if "operations" in domain.lower():
-        hook_vector = "Maritime Chokepoint & Working Capital Drag"
+        hook_vector = "Maritime Chokepoint & Working Capital Drag (Cash Conversion Cycle)"
     else:
-        hook_vector = "Macro Margin Compression & Consulting Automation"
+        hook_vector = "Macro Margin Compression & Strategy Automation (EU AI Act / Policy)"
 
     return {
         "company": company_clean,
@@ -157,10 +175,10 @@ def synthesize_executive_lead(company, location, domain, description):
     }
 
 # ==========================================
-# MAIN EXECUTION ROUTINE
+# 4. MAIN EXECUTION ROUTINE
 # ==========================================
 def main():
-    print("[GHOST Recon] Commencing 4-Hour Pipeline: Priority Scan (Visa/Remote) -> Target Domains...")
+    print("[GHOST Recon] Initializing 4-Tab Multi-Stream Scanner...")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
 
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -169,96 +187,126 @@ def main():
     client = gspread.authorize(creds)
     sheet = client.open_by_key(os.environ['SPREADSHEET_ID'])
 
-    try:
-        ws_jobs = sheet.worksheet("Tactical_Recon_0-3Y")
-    except gspread.exceptions.WorksheetNotFound:
-        ws_jobs = sheet.add_worksheet(title="Tactical_Recon_0-3Y", rows="1000", cols="10")
-        ws_jobs.append_row(COLUMNS_JOBS)
+    # Setup all 4 tabs
+    tabs_config = {
+        "Visa_Sponsorship": COLUMNS_JOBS,
+        "Direct_Domestic_Undisclosed": COLUMNS_JOBS,
+        "Paid_Remote_Internships": COLUMNS_JOBS,
+        "Recruiter_Leads": COLUMNS_LEADS
+    }
 
-    try:
-        ws_leads = sheet.worksheet("Recruiter_Leads")
-    except gspread.exceptions.WorksheetNotFound:
-        ws_leads = sheet.add_worksheet(title="Recruiter_Leads", rows="1000", cols="9")
-        ws_leads.append_row(COLUMNS_LEADS)
-
-    seen_jobs = set(ws_jobs.col_values(9))
-    seen_companies = set(ws_leads.col_values(2))
-
-    new_jobs_batch = []
-    new_leads_batch = []
-
-    for loc in SEARCH_LOCATIONS:
+    worksheets = {}
+    for tab_name, headers in tabs_config.items():
         try:
-            print(f"[GHOST] Scanning: {loc}...")
-            jobs_df = scrape_jobs(
-                site_name=["linkedin", "indeed", "glassdoor"],
-                search_term=SEARCH_TERMS,
-                location=loc,
-                results_wanted=15,
-                hours_old=24,
-                country_indeed='worldwide'
-            )
-            
-            if jobs_df.empty:
-                continue
+            ws = sheet.worksheet(tab_name)
+        except gspread.exceptions.WorksheetNotFound:
+            ws = sheet.add_worksheet(title=tab_name, rows="1000", cols=str(len(headers)))
+            ws.append_row(headers)
+        worksheets[tab_name] = ws
 
-            for _, row in jobs_df.iterrows():
-                title = str(row.get('title', ''))
-                desc = str(row.get('description', ''))
-                company = str(row.get('company', ''))
-                link = str(row.get('job_url', ''))
-                location_val = str(row.get('location', loc))
+    # Cache existing entries to avoid duplication
+    seen_jobs = set(worksheets["Visa_Sponsorship"].col_values(9) + 
+                    worksheets["Direct_Domestic_Undisclosed"].col_values(9) + 
+                    worksheets["Paid_Remote_Internships"].col_values(9))
+    seen_companies = set(worksheets["Recruiter_Leads"].col_values(2))
 
-                if link in seen_jobs or not title or not company:
+    batch_payloads = {
+        "Visa_Sponsorship": [],
+        "Direct_Domestic_Undisclosed": [],
+        "Paid_Remote_Internships": [],
+        "Recruiter_Leads": []
+    }
+
+    # Execute Scrape Streams
+    for stream in SEARCH_STREAMS:
+        query = stream["query"]
+        for loc in stream["locations"]:
+            try:
+                print(f"[GHOST] Running stream [{stream['intent']}] for: {loc}...")
+                jobs_df = scrape_jobs(
+                    site_name=["linkedin", "indeed", "glassdoor"],
+                    search_term=query,
+                    location=loc,
+                    results_wanted=15,
+                    hours_old=48,
+                    country_indeed='worldwide'
+                )
+                
+                if jobs_df.empty:
                     continue
 
-                # Run Hard Gatekeeper & Priority Scorer
-                score, rationale, is_intern, visa = analyze_job(title, desc, row.get('job_type', ''), location_val)
-                if score < 50:
-                    continue
+                for _, row in jobs_df.iterrows():
+                    title = str(row.get('title', ''))
+                    desc = str(row.get('description', ''))
+                    company = str(row.get('company', ''))
+                    link = str(row.get('job_url', ''))
+                    location_val = str(row.get('location', loc))
 
-                # Temp dict for sorting later
-                new_jobs_batch.append({
-                    "score": score,
-                    "row_data": [
+                    if link in seen_jobs or not title or not company or company.lower() == "nan":
+                        continue
+
+                    # Filter and identify target tab
+                    score, rationale, is_intern, visa, bucket = analyze_and_route_job(
+                        title, desc, row.get('job_type', ''), location_val
+                    )
+                    
+                    if not bucket or score < 60:
+                        continue
+
+                    job_record = [
                         today_str, title, company, location_val, str(row.get('salary', 'N/A')),
                         f"{score}%", rationale, visa, link,
-                        f'site:linkedin.com/in "{company}" "recruiter" "{location_val}"'
+                        f'site:linkedin.com/in "{company}" ("recruiter" OR "talent acquisition") "{location_val}"'
                     ]
-                })
-                seen_jobs.add(link)
+                    batch_payloads[bucket].append(job_record)
+                    seen_jobs.add(link)
 
-                # Process Company for Recruiter Lead Generation (Max 5 per 4 hours)
-                if company not in seen_companies and len(new_leads_batch) < 5:
-                    domain_match = "Strategy & Consulting"
-                    for d in ["Operations", "Strategy", "Consulting"]:
-                        if d.lower() in title.lower() or d.lower() in desc.lower():
-                            domain_match = d
-                            break
+                    # Lead Engine (Capture up to 5 verified company contacts per run)
+                    if company not in seen_companies and len(batch_payloads["Recruiter_Leads"]) < 5:
+                        domain_match = "Strategy & Consulting"
+                        for d in ["Operations", "Strategy", "Consulting"]:
+                            if d.lower() in title.lower() or d.lower() in desc.lower():
+                                domain_match = d
+                                break
 
-                    lead = synthesize_executive_lead(company, location_val, domain_match, desc)
-                    new_leads_batch.append([
-                        today_str, lead['company'], lead['domain'],
-                        lead['target_role'], lead['real_email'], lead['pattern'],
-                        lead['xray_url'], lead['hook_vector'], "Queued"
-                    ])
-                    seen_companies.add(company)
+                        lead = synthesize_executive_lead(company, location_val, domain_match, desc)
+                        batch_payloads["Recruiter_Leads"].append([
+                            today_str, lead['company'], lead['domain'],
+                            lead['target_role'], lead['real_email'], lead['pattern'],
+                            lead['xray_url'], lead['hook_vector'], "Queued"
+                        ])
+                        seen_companies.add(company)
 
+            except Exception as e:
+                print(f"[GHOST] Scraper notice [{stream['intent']}] in {loc}: {e}")
+
+    # Commit all batches to their respective tabs
+    for tab_name, rows in batch_payloads.items():
+        if rows:
+            ws = worksheets[tab_name]
+            ws.append_rows(rows, value_input_option='USER_ENTERED')
+            print(f"[GHOST] Added {len(rows)} records into '{tab_name}'.")
+
+    # Auto-resize columns across all 4 tabs
+    for tab_name, ws in worksheets.items():
+        try:
+            sheet.batch_update({
+                "requests": [{
+                    "autoResizeDimensions": {
+                        "dimensions": {
+                            "sheetId": ws.id,
+                            "dimension": "COLUMNS",
+                            "startIndex": 0,
+                            "endIndex": len(tabs_config[tab_name])
+                        }
+                    }
+                }]
+            })
+            time.sleep(1)
         except Exception as e:
-            print(f"[GHOST] Scraper notice for {loc}: {e}")
+            print(f"[GHOST] Auto-resize note for {tab_name}: {e}")
 
-    # Sort jobs by Priority Score (Highest first) before appending
-    if new_jobs_batch:
-        new_jobs_batch = sorted(new_jobs_batch, key=lambda x: x['score'], reverse=True)
-        jobs_to_append = [job['row_data'] for job in new_jobs_batch]
-        ws_jobs.append_rows(jobs_to_append, value_input_option='USER_ENTERED')
-        print(f"[GHOST] Committed {len(jobs_to_append)} prioritized roles.")
-
-    if new_leads_batch:
-        ws_leads.append_rows(new_leads_batch, value_input_option='USER_ENTERED')
-        print(f"[GHOST] Committed {len(new_leads_batch)} Recruiter Leads.")
-
-    print("[GHOST] 4-Hour Cycle Complete.")
+    print("[GHOST Recon] 4-Tab Synchronization Complete.")
 
 if __name__ == "__main__":
     main()
