@@ -3,6 +3,9 @@ import json
 import time
 import re
 import urllib.parse
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 import pandas as pd
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
@@ -11,7 +14,6 @@ from jobspy import scrape_jobs
 # ==========================================
 # 1. SEARCH STREAMS & PARAMETERS
 # ==========================================
-# Instead of boolean queries that crash job boards, we use rapid, simple keyword bursts.
 SEARCH_TASKS = [
     # Visa Sponsorship Stream
     {"query": "visa sponsorship consulting", "loc": "United Kingdom"},
@@ -44,7 +46,6 @@ COLUMNS_LEADS = [
     "Direct LinkedIn X-Ray URL", "Operational Hook Vector", "Outreach Status"
 ]
 
-# Strict exclusions: Dropping Analyst, Engineer, and Senior roles as requested
 BANNED_TITLE_KEYWORDS = [
     "vp", "vice president", "chief", "director", "head of", "principal", 
     "lead", "senior manager", "sr. manager", "managing consultant", 
@@ -104,7 +105,6 @@ def analyze_and_route_job(title, description, job_type, location, source_query):
     else:
         visa_status = "Undisclosed / Verify"
 
-    # Route to the correct tab based on attributes
     if visa_status == "Sponsorship Offered":
         assigned_bucket = "Visa_Sponsorship"
         score = 90
@@ -153,7 +153,7 @@ def synthesize_executive_lead(company, location, domain, description):
     xray_query = f'site:linkedin.com/in ("{target_role.split(" / ")[0]}" OR "recruiter") "{company_clean}" "{location}"'
     xray_url = f"https://www.google.com/search?q={urllib.parse.quote(xray_query)}"
 
-    hook_vector = "Maritime Chokepoint & Working Capital Drag (Cash Conversion Cycle)" if "operations" in domain.lower() else "Macro Margin Compression & Strategy Automation (EU AI Act)"
+    hook_vector = "Maritime Chokepoint & Working Capital Drag" if "operations" in domain.lower() else "Macro Margin Compression & Strategy Automation"
 
     return {
         "company": company_clean,
@@ -166,10 +166,107 @@ def synthesize_executive_lead(company, location, domain, description):
     }
 
 # ==========================================
-# 4. MAIN EXECUTION ROUTINE
+# 4. EMAIL DISPATCH ENGINE
+# ==========================================
+def send_recon_email(batch_payloads, total_new_jobs, total_new_leads):
+    sender_email = os.environ.get('GMAIL_USER')
+    sender_password = os.environ.get('GMAIL_APP_PASSWORD')
+    recipient_email = os.environ.get('RECIPIENT_EMAIL', sender_email)
+
+    if not sender_email or not sender_password or (total_new_jobs == 0 and total_new_leads == 0):
+        print("[GHOST Email] No new positions logged or email credentials missing. Skipping dispatch.")
+        return
+
+    today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
+    msg = MIMEMultipart()
+    msg['From'] = f"GHOST Intelligence Node <{sender_email}>"
+    msg['To'] = recipient_email
+    msg['Subject'] = f"GHOST Recon Alert: {total_new_jobs} Early-Career Roles & {total_new_leads} Leads Logged"
+
+    html_content = f"""
+    <div style="font-family: Arial, sans-serif; color: #111; max-width: 650px; line-height: 1.5;">
+        <h2 style="color: #0d1117; margin-bottom: 4px;">GHOST Autonomous Recon: 4-Hour Sync</h2>
+        <p style="color: #586069; font-size: 13px; margin-top: 0;">Executed at {today_str} UTC | Target Corridors: Dubai, UK, Singapore, US, Remote</p>
+        <hr style="border: 0; border-top: 1px solid #e1e4e8; margin: 16px 0;" />
+
+        <div style="background-color: #f6f8fa; border: 1px solid #d1d5da; border-radius: 6px; padding: 12px; margin-bottom: 16px;">
+            <strong style="color: #24292e;">Cycle Ingestion Summary:</strong>
+            <ul style="margin: 8px 0 0 0; padding-left: 20px; font-size: 14px;">
+                <li><strong>Visa Sponsorship Roles:</strong> {len(batch_payloads['Visa_Sponsorship'])}</li>
+                <li><strong>Remote Paid Internships:</strong> {len(batch_payloads['Paid_Remote_Internships'])}</li>
+                <li><strong>Direct Strategy/Ops Roles:</strong> {len(batch_payloads['Direct_Domestic_Undisclosed'])}</li>
+                <li><strong>Executive & Recruiter Leads:</strong> {len(batch_payloads['Recruiter_Leads'])}</li>
+            </ul>
+        </div>
+    """
+
+    # Highlight top jobs if available
+    all_jobs = batch_payloads['Visa_Sponsorship'] + batch_payloads['Paid_Remote_Internships'] + batch_payloads['Direct_Domestic_Undisclosed']
+    if all_jobs:
+        html_content += """
+        <h3 style="color: #0366d6; margin-bottom: 8px;">Top Ingested Opportunities</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+            <tr style="background-color: #eaecef; text-align: left;">
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Job Title</th>
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Company</th>
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Location</th>
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Visa Status</th>
+            </tr>
+        """
+        for job in all_jobs[:6]:
+            html_content += f"""
+            <tr>
+                <td style="padding: 6px; border: 1px solid #d1d5da;"><a href="{job[8]}" style="color: #0366d6; text-decoration: none;"><b>{job[1]}</b></a></td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{job[2]}</td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{job[3]}</td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{job[7]}</td>
+            </tr>
+            """
+        html_content += "</table>"
+
+    if batch_payloads['Recruiter_Leads']:
+        html_content += """
+        <h3 style="color: #28a745; margin-top: 20px; margin-bottom: 8px;">Captured Recruiter & Executive Leads</h3>
+        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+            <tr style="background-color: #eaecef; text-align: left;">
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Target Firm</th>
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Target Persona</th>
+                <th style="padding: 6px; border: 1px solid #d1d5da;">Contact Email / Pattern</th>
+            </tr>
+        """
+        for lead in batch_payloads['Recruiter_Leads']:
+            contact = lead[4] if lead[4] != "Pending X-Ray Outreach" else lead[5]
+            html_content += f"""
+            <tr>
+                <td style="padding: 6px; border: 1px solid #d1d5da;"><b>{lead[1]}</b> ({lead[2]})</td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{lead[3]}</td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;"><code>{contact}</code></td>
+            </tr>
+            """
+        html_content += "</table>"
+
+    html_content += """
+        <p style="font-size: 12px; color: #586069; margin-top: 24px;">All records have been synchronized and auto-formatted in your HOLO_EARTH Google Sheet database.</p>
+    </div>
+    """
+
+    msg.attach(MIMEText(html_content, 'html'))
+
+    try:
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.send_message(msg)
+        server.quit()
+        print(f"[GHOST Email] Alert successfully sent to {recipient_email}")
+    except Exception as e:
+        print(f"[GHOST Email] Dispatch failed: {e}")
+
+# ==========================================
+# 5. MAIN EXECUTION ROUTINE
 # ==========================================
 def main():
-    print("[GHOST Recon] Initializing High-Velocity Burst Scanner...")
+    print("[GHOST Recon] Initializing 4-Hour Intelligence Engine...")
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
 
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
@@ -207,23 +304,22 @@ def main():
         "Recruiter_Leads": []
     }
 
-    # Execute Burst Scrape Tasks
+    # Execute Searches
     for task in SEARCH_TASKS:
         query = task["query"]
         loc = task["loc"]
         try:
-            print(f"[GHOST] Burst Search -> Query: '{query}' | Loc: '{loc}'")
+            print(f"[GHOST] Scanning: '{query}' in '{loc}'...")
             jobs_df = scrape_jobs(
                 site_name=["linkedin", "indeed"],
                 search_term=query,
                 location=loc,
                 results_wanted=15,
-                hours_old=72, # Expanded lookback window to guarantee yield
+                hours_old=72,
                 country_indeed='worldwide'
             )
             
             if jobs_df.empty:
-                print(f"[GHOST] No results for '{query}' in {loc}.")
                 continue
 
             for _, row in jobs_df.iterrows():
@@ -251,7 +347,7 @@ def main():
                 batch_payloads[bucket].append(job_record)
                 seen_jobs.add(link)
 
-                # Lead Engine (Capture up to 5 unique company leads per 4 hours)
+                # Capture up to 5 Recruiter Leads
                 if company not in seen_companies and len(batch_payloads["Recruiter_Leads"]) < 5:
                     domain_match = "Strategy & Consulting"
                     for d in ["Operations", "Strategy", "Consulting"]:
@@ -268,17 +364,65 @@ def main():
                     seen_companies.add(company)
 
         except Exception as e:
-            print(f"[GHOST] Scraper notice for '{query}': {e}")
-            time.sleep(2) # Throttle to prevent IP blocks
+            print(f"[GHOST] Notice for '{query}': {e}")
+            time.sleep(1.5)
 
-    # Commit all batches
+    total_jobs_added = sum(len(batch_payloads[k]) for k in ["Visa_Sponsorship", "Direct_Domestic_Undisclosed", "Paid_Remote_Internships"])
+    total_leads_added = len(batch_payloads["Recruiter_Leads"])
+
+    # Commit Batches
     for tab_name, rows in batch_payloads.items():
         if rows:
             ws = worksheets[tab_name]
             ws.append_rows(rows, value_input_option='USER_ENTERED')
-            print(f"[GHOST] Added {len(rows)} records into '{tab_name}'.")
+            print(f"[GHOST] Wrote {len(rows)} rows to '{tab_name}'.")
 
-    print("[GHOST Recon] Run Complete.")
+    # Auto-Format All 4 Worksheets (Wrap, Top Align, Freeze Header, Auto-Resize)
+    for tab_name, ws in worksheets.items():
+        try:
+            sheet.batch_update({
+                "requests": [
+                    {
+                        "updateSheetProperties": {
+                            "properties": {
+                                "sheetId": ws.id,
+                                "gridProperties": {"frozenRowCount": 1}
+                            },
+                            "fields": "gridProperties.frozenRowCount"
+                        }
+                    },
+                    {
+                        "repeatCell": {
+                            "range": {"sheetId": ws.id},
+                            "cell": {
+                                "userEnteredFormat": {
+                                    "wrapStrategy": "WRAP",
+                                    "verticalAlignment": "TOP"
+                                }
+                            },
+                            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)"
+                        }
+                    },
+                    {
+                        "autoResizeDimensions": {
+                            "dimensions": {
+                                "sheetId": ws.id,
+                                "dimension": "COLUMNS",
+                                "startIndex": 0,
+                                "endIndex": len(tabs_config[tab_name])
+                            }
+                        }
+                    }
+                ]
+            })
+            time.sleep(1)
+        except Exception as e:
+            print(f"[GHOST] Formatting notice for {tab_name}: {e}")
+
+    # Dispatch Email Briefing
+    send_recon_email(batch_payloads, total_jobs_added, total_leads_added)
+
+    print("[GHOST Recon] Pipeline Execution Complete.")
 
 if __name__ == "__main__":
     main()
