@@ -312,34 +312,40 @@ def main():
                         "search_query_used": query
                     }
                 }
-                bq_jobs_payload.append(job_record)
-                seen_jobs.add(link)
+                # Job record
+bq_jobs_payload.append({
+    "timestamp": timestamp_iso,
+    "company": company,
+    "signal_type": f"Labor Target: {bucket}",
+    "job_title": title,
+    "location": location_val,
+    "compensation": str(row.get('salary', 'N/A')),
+    "match_score": score,
+    "rationale": rationale,
+    "visa_status": visa,
+    "application_link": link,
+    "recruiter_email": None,
+    "target_persona": None,
+    "hook_vector": None
+})
 
-                # Package the Recruiter Lead for BigQuery
-                if company not in seen_companies and len(bq_leads_payload) < 5:
-                    domain_match = "Strategy & Consulting"
-                    for d in ["Operations", "Strategy", "Consulting"]:
-                        if d.lower() in title.lower() or d.lower() in desc.lower():
-                            domain_match = d
-                            break
+# Lead record
+bq_leads_payload.append({
+    "timestamp": timestamp_iso,
+    "company": company,
+    "signal_type": "Executive Lead Extracted",
+    "job_title": None,
+    "location": location_val,
+    "compensation": None,
+    "match_score": None,
+    "rationale": None,
+    "visa_status": None,
+    "application_link": lead['xray_url'],
+    "recruiter_email": lead['real_email'],
+    "target_persona": lead['target_role'],
+    "hook_vector": lead['hook_vector']
+})
 
-                    lead = synthesize_executive_lead(company, location_val, domain_match, desc)
-                    lead_record = {
-                        "timestamp": timestamp_iso,
-                        "domain": "GHOST",
-                        "entity_id": company,
-                        "signal_type": "Executive Lead Extracted",
-                        "raw_data": {
-                            "practice_domain": lead['domain'],
-                            "target_persona": lead['target_role'],
-                            "extracted_email": lead['real_email'],
-                            "corporate_pattern": lead['pattern'],
-                            "xray_url": lead['xray_url'],
-                            "hook_vector": lead['hook_vector']
-                        }
-                    }
-                    bq_leads_payload.append(lead_record)
-                    seen_companies.add(company)
 
         except Exception as e:
             print(f"[GHOST] Notice for '{query}': {e}")
