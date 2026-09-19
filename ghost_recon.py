@@ -6,10 +6,11 @@ import urllib.parse
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
+from datetime import datetime
 import pandas as pd
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
 from jobspy import scrape_jobs
+from google.cloud import bigquery
+from google.oauth2 import service_account
 
 # ==========================================
 # 1. SEARCH STREAMS & PARAMETERS
@@ -32,18 +33,6 @@ SEARCH_TASKS = [
     {"query": "junior consultant", "loc": "Singapore"},
     {"query": "operations associate", "loc": "United States"},
     {"query": "management trainee", "loc": "United Kingdom"}
-]
-
-COLUMNS_JOBS = [
-    "Date Found", "Job Title", "Company", "Location", "Compensation",
-    "Portfolio Match (%)", "Strategic Match Rationale", "Visa Status",
-    "Application Link", "Hiring Lead Search Query"
-]
-
-COLUMNS_LEADS = [
-    "Date Logged", "Target Company", "Practice Domain", "Target Persona / Recruiter",
-    "Extracted Real Email (From JD)", "Estimated Corporate Pattern", 
-    "Direct LinkedIn X-Ray URL", "Operational Hook Vector", "Outreach Status"
 ]
 
 BANNED_TITLE_KEYWORDS = [
@@ -106,15 +95,15 @@ def analyze_and_route_job(title, description, job_type, location, source_query):
         visa_status = "Undisclosed / Verify"
 
     if visa_status == "Sponsorship Offered":
-        assigned_bucket = "Visa_Sponsorship"
+        assigned_bucket = "Visa Sponsorship"
         score = 90
         rationale = "PRIORITY: Verified Visa Sponsorship"
     elif is_intern and is_remote:
-        assigned_bucket = "Paid_Remote_Internships"
+        assigned_bucket = "Paid Remote Internship"
         score = 85
         rationale = "PRIORITY: Remote Internship Position"
     else:
-        assigned_bucket = "Direct_Domestic_Undisclosed"
+        assigned_bucket = "Direct Role (Undisclosed)"
         score = 75
         rationale = "Direct Strategy/Ops Role (0-3Y)"
 
@@ -166,43 +155,43 @@ def synthesize_executive_lead(company, location, domain, description):
     }
 
 # ==========================================
-# 4. EMAIL DISPATCH ENGINE
+# 4. BIGQUERY INGESTION ENGINE
 # ==========================================
-def send_recon_email(batch_payloads, total_new_jobs, total_new_leads):
+def stream_to_bigquery(client, table_id, rows_to_insert):
+    if not rows_to_insert:
+        return
+    errors = client.insert_rows_json(table_id, rows_to_insert)
+    if errors:
+        print(f"[BIGQUERY ERROR] {errors}")
+    else:
+        print(f"[BIGQUERY] Successfully injected {len(rows_to_insert)} records.")
+
+# ==========================================
+# 5. EMAIL DISPATCH ENGINE
+# ==========================================
+def send_recon_email(jobs_payload, leads_payload):
     sender_email = os.environ.get('GMAIL_USER')
     sender_password = os.environ.get('GMAIL_APP_PASSWORD')
     recipient_email = os.environ.get('RECIPIENT_EMAIL', sender_email)
 
-    if not sender_email or not sender_password or (total_new_jobs == 0 and total_new_leads == 0):
-        print("[GHOST Email] No new positions logged or email credentials missing. Skipping dispatch.")
+    if not sender_email or not sender_password or (not jobs_payload and not leads_payload):
         return
 
     today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
     msg = MIMEMultipart()
     msg['From'] = f"GHOST Intelligence Node <{sender_email}>"
     msg['To'] = recipient_email
-    msg['Subject'] = f"GHOST Recon Alert: {total_new_jobs} Early-Career Roles & {total_new_leads} Leads Logged"
+    msg['Subject'] = f"GHOST Recon Alert: {len(jobs_payload)} Roles & {len(leads_payload)} Leads Pushed to BigQuery"
 
     html_content = f"""
     <div style="font-family: Arial, sans-serif; color: #111; max-width: 650px; line-height: 1.5;">
-        <h2 style="color: #0d1117; margin-bottom: 4px;">GHOST Autonomous Recon: 4-Hour Sync</h2>
-        <p style="color: #586069; font-size: 13px; margin-top: 0;">Executed at {today_str} UTC | Target Corridors: Dubai, UK, Singapore, US, Remote</p>
+        <h2 style="color: #0d1117; margin-bottom: 4px;">GHOST Autonomous Recon: BigQuery Sync</h2>
+        <p style="color: #586069; font-size: 13px; margin-top: 0;">Executed at {today_str} UTC | Target Corridors: Global</p>
         <hr style="border: 0; border-top: 1px solid #e1e4e8; margin: 16px 0;" />
-
-        <div style="background-color: #f6f8fa; border: 1px solid #d1d5da; border-radius: 6px; padding: 12px; margin-bottom: 16px;">
-            <strong style="color: #24292e;">Cycle Ingestion Summary:</strong>
-            <ul style="margin: 8px 0 0 0; padding-left: 20px; font-size: 14px;">
-                <li><strong>Visa Sponsorship Roles:</strong> {len(batch_payloads['Visa_Sponsorship'])}</li>
-                <li><strong>Remote Paid Internships:</strong> {len(batch_payloads['Paid_Remote_Internships'])}</li>
-                <li><strong>Direct Strategy/Ops Roles:</strong> {len(batch_payloads['Direct_Domestic_Undisclosed'])}</li>
-                <li><strong>Executive & Recruiter Leads:</strong> {len(batch_payloads['Recruiter_Leads'])}</li>
-            </ul>
-        </div>
+        <p>Your BigQuery <b>market_signals</b> table has been synchronized with the latest labor intelligence.</p>
     """
 
-    # Highlight top jobs if available
-    all_jobs = batch_payloads['Visa_Sponsorship'] + batch_payloads['Paid_Remote_Internships'] + batch_payloads['Direct_Domestic_Undisclosed']
-    if all_jobs:
+    if jobs_payload:
         html_content += """
         <h3 style="color: #0366d6; margin-bottom: 8px;">Top Ingested Opportunities</h3>
         <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
@@ -213,40 +202,19 @@ def send_recon_email(batch_payloads, total_new_jobs, total_new_leads):
                 <th style="padding: 6px; border: 1px solid #d1d5da;">Visa Status</th>
             </tr>
         """
-        for job in all_jobs[:6]:
+        for job in jobs_payload[:6]:
             html_content += f"""
             <tr>
-                <td style="padding: 6px; border: 1px solid #d1d5da;"><a href="{job[8]}" style="color: #0366d6; text-decoration: none;"><b>{job[1]}</b></a></td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{job[2]}</td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{job[3]}</td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{job[7]}</td>
-            </tr>
-            """
-        html_content += "</table>"
-
-    if batch_payloads['Recruiter_Leads']:
-        html_content += """
-        <h3 style="color: #28a745; margin-top: 20px; margin-bottom: 8px;">Captured Recruiter & Executive Leads</h3>
-        <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
-            <tr style="background-color: #eaecef; text-align: left;">
-                <th style="padding: 6px; border: 1px solid #d1d5da;">Target Firm</th>
-                <th style="padding: 6px; border: 1px solid #d1d5da;">Target Persona</th>
-                <th style="padding: 6px; border: 1px solid #d1d5da;">Contact Email / Pattern</th>
-            </tr>
-        """
-        for lead in batch_payloads['Recruiter_Leads']:
-            contact = lead[4] if lead[4] != "Pending X-Ray Outreach" else lead[5]
-            html_content += f"""
-            <tr>
-                <td style="padding: 6px; border: 1px solid #d1d5da;"><b>{lead[1]}</b> ({lead[2]})</td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{lead[3]}</td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;"><code>{contact}</code></td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;"><a href="{job['raw_data']['application_link']}" style="color: #0366d6; text-decoration: none;"><b>{job['raw_data']['job_title']}</b></a></td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{job['entity_id']}</td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{job['raw_data']['location']}</td>
+                <td style="padding: 6px; border: 1px solid #d1d5da;">{job['raw_data']['visa_status']}</td>
             </tr>
             """
         html_content += "</table>"
 
     html_content += """
-        <p style="font-size: 12px; color: #586069; margin-top: 24px;">All records have been synchronized and auto-formatted in your HOLO_EARTH Google Sheet database.</p>
+        <p style="font-size: 12px; color: #586069; margin-top: 24px;">All records are queryable in HOLO-EARTH-CORE BigQuery Console.</p>
     </div>
     """
 
@@ -263,48 +231,24 @@ def send_recon_email(batch_payloads, total_new_jobs, total_new_leads):
         print(f"[GHOST Email] Dispatch failed: {e}")
 
 # ==========================================
-# 5. MAIN EXECUTION ROUTINE
+# 6. MAIN EXECUTION ROUTINE
 # ==========================================
 def main():
-    print("[GHOST Recon] Initializing 4-Hour Intelligence Engine...")
-    today_str = pd.Timestamp.now().strftime('%Y-%m-%d %H:%M')
-
-    scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+    print("[GHOST Recon] Initializing BigQuery Ingestion Engine...")
+    
+    # 1. Authenticate with BigQuery
     creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(os.environ['SPREADSHEET_ID'])
+    credentials = service_account.Credentials.from_service_account_info(creds_dict)
+    client = bigquery.Client(credentials=credentials, project=creds_dict['project_id'])
+    table_id = f"{creds_dict['project_id']}.telemetry_bronze.market_signals"
 
-    tabs_config = {
-        "Visa_Sponsorship": COLUMNS_JOBS,
-        "Direct_Domestic_Undisclosed": COLUMNS_JOBS,
-        "Paid_Remote_Internships": COLUMNS_JOBS,
-        "Recruiter_Leads": COLUMNS_LEADS
-    }
+    seen_jobs = set()
+    seen_companies = set()
+    
+    bq_jobs_payload = []
+    bq_leads_payload = []
 
-    worksheets = {}
-    for tab_name, headers in tabs_config.items():
-        try:
-            ws = sheet.worksheet(tab_name)
-        except gspread.exceptions.WorksheetNotFound:
-            ws = sheet.add_worksheet(title=tab_name, rows="1000", cols=str(len(headers)))
-            ws.append_row(headers)
-            time.sleep(1)
-        worksheets[tab_name] = ws
-
-    seen_jobs = set(worksheets["Visa_Sponsorship"].col_values(9) + 
-                    worksheets["Direct_Domestic_Undisclosed"].col_values(9) + 
-                    worksheets["Paid_Remote_Internships"].col_values(9))
-    seen_companies = set(worksheets["Recruiter_Leads"].col_values(2))
-
-    batch_payloads = {
-        "Visa_Sponsorship": [],
-        "Direct_Domestic_Undisclosed": [],
-        "Paid_Remote_Internships": [],
-        "Recruiter_Leads": []
-    }
-
-    # Execute Searches
+    # 2. Execute Searches
     for task in SEARCH_TASKS:
         query = task["query"]
         loc = task["loc"]
@@ -338,17 +282,31 @@ def main():
                 
                 if not bucket or score < 60:
                     continue
+                
+                timestamp_iso = datetime.utcnow().isoformat()
 
-                job_record = [
-                    today_str, title, company, location_val, str(row.get('salary', 'N/A')),
-                    f"{score}%", rationale, visa, link,
-                    f'site:linkedin.com/in "{company}" ("recruiter" OR "talent acquisition") "{location_val}"'
-                ]
-                batch_payloads[bucket].append(job_record)
+                # Package the Job Record for BigQuery
+                job_record = {
+                    "timestamp": timestamp_iso,
+                    "domain": "GHOST",
+                    "entity_id": company,
+                    "signal_type": f"Labor Target: {bucket}",
+                    "raw_data": {
+                        "job_title": title,
+                        "location": location_val,
+                        "compensation": str(row.get('salary', 'N/A')),
+                        "portfolio_match_score": score,
+                        "strategic_rationale": rationale,
+                        "visa_status": visa,
+                        "application_link": link,
+                        "search_query_used": query
+                    }
+                }
+                bq_jobs_payload.append(job_record)
                 seen_jobs.add(link)
 
-                # Capture up to 5 Recruiter Leads
-                if company not in seen_companies and len(batch_payloads["Recruiter_Leads"]) < 5:
+                # Package the Recruiter Lead for BigQuery
+                if company not in seen_companies and len(bq_leads_payload) < 5:
                     domain_match = "Strategy & Consulting"
                     for d in ["Operations", "Strategy", "Consulting"]:
                         if d.lower() in title.lower() or d.lower() in desc.lower():
@@ -356,72 +314,36 @@ def main():
                             break
 
                     lead = synthesize_executive_lead(company, location_val, domain_match, desc)
-                    batch_payloads["Recruiter_Leads"].append([
-                        today_str, lead['company'], lead['domain'],
-                        lead['target_role'], lead['real_email'], lead['pattern'],
-                        lead['xray_url'], lead['hook_vector'], "Queued"
-                    ])
+                    lead_record = {
+                        "timestamp": timestamp_iso,
+                        "domain": "GHOST",
+                        "entity_id": company,
+                        "signal_type": "Executive Lead Extracted",
+                        "raw_data": {
+                            "practice_domain": lead['domain'],
+                            "target_persona": lead['target_role'],
+                            "extracted_email": lead['real_email'],
+                            "corporate_pattern": lead['pattern'],
+                            "xray_url": lead['xray_url'],
+                            "hook_vector": lead['hook_vector']
+                        }
+                    }
+                    bq_leads_payload.append(lead_record)
                     seen_companies.add(company)
 
         except Exception as e:
             print(f"[GHOST] Notice for '{query}': {e}")
             time.sleep(1.5)
 
-    total_jobs_added = sum(len(batch_payloads[k]) for k in ["Visa_Sponsorship", "Direct_Domestic_Undisclosed", "Paid_Remote_Internships"])
-    total_leads_added = len(batch_payloads["Recruiter_Leads"])
+    # 3. Stream payloads to BigQuery
+    all_payloads = bq_jobs_payload + bq_leads_payload
+    if all_payloads:
+        stream_to_bigquery(client, table_id, all_payloads)
+    else:
+        print("[GHOST] No new high-priority roles found this cycle.")
 
-    # Commit Batches
-    for tab_name, rows in batch_payloads.items():
-        if rows:
-            ws = worksheets[tab_name]
-            ws.append_rows(rows, value_input_option='USER_ENTERED')
-            print(f"[GHOST] Wrote {len(rows)} rows to '{tab_name}'.")
-
-    # Auto-Format All 4 Worksheets (Wrap, Top Align, Freeze Header, Auto-Resize)
-    for tab_name, ws in worksheets.items():
-        try:
-            sheet.batch_update({
-                "requests": [
-                    {
-                        "updateSheetProperties": {
-                            "properties": {
-                                "sheetId": ws.id,
-                                "gridProperties": {"frozenRowCount": 1}
-                            },
-                            "fields": "gridProperties.frozenRowCount"
-                        }
-                    },
-                    {
-                        "repeatCell": {
-                            "range": {"sheetId": ws.id},
-                            "cell": {
-                                "userEnteredFormat": {
-                                    "wrapStrategy": "WRAP",
-                                    "verticalAlignment": "TOP"
-                                }
-                            },
-                            "fields": "userEnteredFormat(wrapStrategy,verticalAlignment)"
-                        }
-                    },
-                    {
-                        "autoResizeDimensions": {
-                            "dimensions": {
-                                "sheetId": ws.id,
-                                "dimension": "COLUMNS",
-                                "startIndex": 0,
-                                "endIndex": len(tabs_config[tab_name])
-                            }
-                        }
-                    }
-                ]
-            })
-            time.sleep(1)
-        except Exception as e:
-            print(f"[GHOST] Formatting notice for {tab_name}: {e}")
-
-    # Dispatch Email Briefing
-    send_recon_email(batch_payloads, total_jobs_added, total_leads_added)
-
+    # 4. Dispatch Email Briefing
+    send_recon_email(bq_jobs_payload, bq_leads_payload)
     print("[GHOST Recon] Pipeline Execution Complete.")
 
 if __name__ == "__main__":
