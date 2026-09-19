@@ -160,11 +160,21 @@ def synthesize_executive_lead(company, location, domain, description):
 def stream_to_bigquery(client, table_id, rows_to_insert):
     if not rows_to_insert:
         return
-    errors = client.insert_rows_json(table_id, rows_to_insert)
-    if errors:
-        print(f"[BIGQUERY ERROR] {errors}")
-    else:
-        print(f"[BIGQUERY] Successfully injected {len(rows_to_insert)} records.")
+        
+    try:
+        # Sandbox workaround: Use a Batch Load Job instead of Streaming
+        job_config = bigquery.LoadJobConfig(
+            source_format=bigquery.SourceFormat.NEWLINE_DELIMITED_JSON,
+            write_disposition=bigquery.WriteDisposition.WRITE_APPEND,
+        )
+        
+        job = client.load_table_from_json(rows_to_insert, table_id, job_config=job_config)
+        job.result()  # Waits for the upload to finish
+        
+        print(f"[BIGQUERY] Successfully batch-loaded {len(rows_to_insert)} records.")
+    except Exception as e:
+        print(f"[BIGQUERY ERROR] {e}")
+
 
 # ==========================================
 # 5. EMAIL DISPATCH ENGINE
