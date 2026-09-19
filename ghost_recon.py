@@ -250,7 +250,7 @@ def main():
     creds_dict = json.loads(os.environ['GOOGLE_CREDENTIALS'])
     credentials = service_account.Credentials.from_service_account_info(creds_dict)
     client = bigquery.Client(credentials=credentials, project=creds_dict['project_id'])
-    table_id = f"{creds_dict['project_id']}.telemetry_bronze.market_signals"
+    table_id = f"{creds_dict['project_id']}.telemetry_bronze.ghost_labor"
 
     seen_jobs = set()
     seen_companies = set()
