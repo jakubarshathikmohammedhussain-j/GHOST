@@ -214,13 +214,14 @@ def send_recon_email(jobs_payload, leads_payload):
         """
         for job in jobs_payload[:6]:
             html_content += f"""
-            <tr>
-                <td style="padding: 6px; border: 1px solid #d1d5da;"><a href="{job['raw_data']['application_link']}" style="color: #0366d6; text-decoration: none;"><b>{job['raw_data']['job_title']}</b></a></td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{job['entity_id']}</td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{job['raw_data']['location']}</td>
-                <td style="padding: 6px; border: 1px solid #d1d5da;">{job['raw_data']['visa_status']}</td>
-            </tr>
-            """
+                    <tr>
+                      <td style="padding: 6px; border: 1px solid #d1d5da;"><a href="{job.get('application_link', '#')}" style="color: #0366d6; text-decoration: none;"><b>{job.get('job_title', 'N/A')}</b></a></td>
+                      <td style="padding: 6px; border: 1px solid #d1d5da;">{job.get('company', 'N/A')}</td>
+                      <td style="padding: 6px; border: 1px solid #d1d5da;">{job.get('location', 'N/A')}</td>
+                      <td style="padding: 6px; border: 1px solid #d1d5da;">{job.get('visa_status', 'N/A')}</td>
+                    </tr>
+                    """
+
         html_content += "</table>"
 
     html_content += """
